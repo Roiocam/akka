@@ -14,8 +14,11 @@ import akka.stream.scaladsl.Sink
 import akka.stream.scaladsl.Source
 import org.openjdk.jmh.annotations._
 
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import scala.concurrent.Await
+import scala.concurrent.ExecutionContext
+import scala.concurrent.ExecutionContextExecutor
 import scala.concurrent.Future
 import scala.concurrent.duration.Duration
 import scala.concurrent.duration._
@@ -25,9 +28,22 @@ import scala.concurrent.duration._
 @BenchmarkMode(Array(Mode.Throughput))
 class BatchBenchmark {
   implicit val system: ActorSystem = ActorSystem("BatchBenchmark")
+  val ex = Executors.newSingleThreadExecutor()
+  implicit val executor: ExecutionContextExecutor = ExecutionContext.fromExecutor(ex)
 
   val NumberOfElements = 100000
-  @Param(Array("groupedWeightedWithin", "batchWeighted"))
+  val SmallWindows = 100
+  val LargeWindows = NumberOfElements << 1
+  val BufferSize = 100
+  val Timeout = 100.millis
+  @Param(
+    Array(
+      "groupedWeightedWithin",
+      "batchWeighted",
+      "groupedWeightedWithin_withLargeWindows",
+      "batchWeighted_withLargeWindows",
+      "groupedWeightedWithin_withBuffer",
+      "batchWeighted_withBuffer"))
   var BatchWith = ""
 
   var graph: RunnableGraph[Future[Done]] = _
@@ -38,22 +54,50 @@ class BatchBenchmark {
   @Setup
   def setup(): Unit = {
     val source = createSource(NumberOfElements)
+    val slowSink: Sink[Any, Future[Done]] = Sink.foreachAsync(1)(processElement)
     graph = BatchWith match {
       case "groupedWeightedWithin" =>
-        Source.fromGraph(source).groupedWeightedWithin(100, 100.millis)(_ => 1).toMat(Sink.ignore)(Keep.right)
+        Source.fromGraph(source).groupedWeightedWithin(SmallWindows, Timeout)(_ => 1).toMat(slowSink)(Keep.right)
       case "batchWeighted" =>
         Source
           .fromGraph(source)
-          .batchWeighted(max = 100, _ => 1, seed = i => i)(aggregate = _ + _)
-          .toMat(Sink.ignore)(Keep.right)
+          .batchWeighted(max = SmallWindows, _ => 1, seed = i => i)(aggregate = _ + _)
+          .toMat(slowSink)(Keep.right)
+      case "groupedWeightedWithin_withLargeWindows" =>
+        Source.fromGraph(source).groupedWeightedWithin(LargeWindows, Timeout)(_ => 1).toMat(slowSink)(Keep.right)
+      case "batchWeighted_withLargeWindows" =>
+        Source
+          .fromGraph(source)
+          .batchWeighted(max = LargeWindows, _ => 1, seed = i => i)(aggregate = _ + _)
+          .toMat(slowSink)(Keep.right)
+      case "groupedWeightedWithin_withBuffer" =>
+        Source
+          .fromGraph(source)
+          .groupedWeightedWithin(LargeWindows, Timeout)(_ => 1)
+          .buffer(BufferSize, OverflowStrategy.backpressure)
+          .toMat(slowSink)(Keep.right)
+      case "batchWeighted_withBuffer" =>
+        Source
+          .fromGraph(source)
+          .batchWeighted(max = LargeWindows, _ => 1, seed = i => i)(aggregate = _ + _)
+          .buffer(BufferSize, OverflowStrategy.backpressure)
+          .toMat(slowSink)(Keep.right)
     }
 
     // eager init of materializer
     SystemMaterializer(system).materializer
   }
 
+  def processElement(ele: Any): Future[Unit] = {
+    Future {
+      Thread.sleep(10)
+      ele.hashCode()
+    }
+  }
+
   @TearDown
   def shutdown(): Unit = {
+    ex.shutdown()
     Await.result(system.terminate(), 5.seconds)
   }
 
